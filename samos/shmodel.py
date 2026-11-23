@@ -37,7 +37,7 @@ class SHModel:
 
     # ------------------------------------------------------------------ readers
     @classmethod
-    def read_sch_igrf(cls, filename = "/home/thedos/prosastra/geoplanet_coding/samos/data/IGRF14.shc"):
+    def read_sch_igrf(cls, filename = "/project/samos/data/IGRF14.shc"):
         """
         Read an IGRF .shc file. The last (predictive) column is not kept as an
         epoch; it only defines the secular variation of the final interval.
@@ -68,6 +68,85 @@ class SHModel:
 
         return cls(G[:-1], H[:-1], dG, dH, all_epochs[:-1], N_degree,
                    valid_until = all_epochs[-1])
+
+    @classmethod
+    def read_pygeodyn(cls, filename, realisation = None, sv = 'diff'):
+        """
+        Read the main field of a pygeodyn reanalysis (HDF5 file with an
+        'analysed' group, e.g. 2023_gji_gnm_GOVO.hdf5).
+
+        Parameters
+        ----------
+        filename : str or Path
+        realisation : None or int
+            None -> ensemble mean (default); int -> that ensemble member.
+        sv : 'diff' or 'file'
+            'diff' (default): secular variation from finite differences between
+                consecutive analyses, so the field is continuous and passes exactly
+                through every analysis (same construction as read_sch_igrf).
+            'file': the SV stored in the file at each analysis (the filter's own
+                SV). The field then jumps slightly at each analysis time.
+
+        The model is valid from the first to the last analysis time.
+        Requires h5py.
+        """
+        import h5py                                         # optional dependency
+
+        if sv not in ('diff', 'file'):
+            raise ValueError("sv must be 'diff' or 'file'")
+        sel = slice(None) if realisation is None else int(realisation)
+
+        with h5py.File(filename, 'r') as f:
+            group = f['analysed']
+            N_degree = int(f.attrs['Lb'])
+            times = group['times'][()].astype(float)
+            MF = group['MF'][sel].astype(float)             # (Nt, K) or (n_real, Nt, K)
+            SV = group['SV'][sel].astype(float) if sv == 'file' else None
+
+        if realisation is None:                             # ensemble mean
+            MF = MF.mean(axis = 0)
+            SV = SV.mean(axis = 0) if SV is not None else None
+
+        # analyses are at month starts, stored as rounded float32 decimal years;
+        # recover the exact dates and express them in this class's time convention
+        months = np.round((times - 1970) * 12).astype(int)
+        dates = np.datetime64('1970-01', 'M') + months
+        epochs = cls._decimal_year(dates)
+
+        def to_flat(c):
+            pos, is_h = cls._pygeodyn_index(N_degree)
+            assert c.shape[-1] == len(pos), 'unexpected number of coefficients'
+            G = np.zeros((c.shape[0], (N_degree + 1) * (N_degree + 2) // 2))
+            H = np.zeros_like(G)
+            G[:, pos[~is_h]] = c[:, ~is_h]
+            H[:, pos[is_h]] = c[:, is_h]
+            return G, H
+
+        G, H = to_flat(MF)
+        if sv == 'file':
+            dG, dH = to_flat(SV)
+        else:
+            dt = np.diff(epochs)[:, None]
+            dG = np.diff(G, axis = 0) / dt
+            dH = np.diff(H, axis = 0) / dt
+            # last epoch only used at t = epochs[-1] (dt = 0); repeat the last slope
+            dG, dH = np.vstack((dG, dG[-1:])), np.vstack((dH, dH[-1:]))
+
+        return cls(G, H, dG, dH, epochs, N_degree, valid_until = epochs[-1])
+
+    @staticmethod
+    def _pygeodyn_index(N_degree):
+        """
+        Flat (tril) position and is-h flag of each coefficient in the pygeodyn
+        ordering g10, g11, h11, g20, g21, h21, g22, h22, ...
+        """
+        pos, is_h = [], []
+        for n in range(1, N_degree + 1):
+            for m in range(n + 1):
+                pos.append(n * (n + 1) // 2 + m); is_h.append(False)
+                if m > 0:
+                    pos.append(n * (n + 1) // 2 + m); is_h.append(True)
+        return np.array(pos), np.array(is_h)
 
     # ------------------------------------------------------------------ time
     @staticmethod
